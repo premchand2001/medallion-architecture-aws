@@ -1,76 +1,179 @@
 # medallion-architecture-aws
 
-Production-grade Medallion Architecture (Bronze / Silver / Gold) on Amazon S3 using Delta Lake, AWS Glue, EMR, Apache Airflow (MWAA), and Snowflake — built from real healthcare data engineering work at Optum (UnitedHealth Group).
+Production-grade Medallion Architecture (Bronze / Silver / Gold) on Amazon S3 using Delta Lake, AWS Glue, EMR PySpark, Apache Airflow on MWAA, and Snowflake. Built from real healthcare data engineering work at **Optum (UnitedHealth Group)**, processing **10M+ daily records** across multiple clinical business units.
 
-## Architecture Overview
+---
+
+## Why This Exists
+
+Legacy Datastage and SSIS pipelines at Optum couldn't scale to the volume, schema variance, or audit requirements of modern healthcare data. This framework replaced them — moving to a fully cloud-native, ACID-compliant Delta Lake architecture where every record is traceable from raw source to gold-layer consumption.
+
+---
+
+## Architecture
 
 ```
-Raw Sources (CSV/JSON/flat files)
-        │
-        ▼
-┌──────────────┐
-│   BRONZE     │  Raw ingestion, no transforms, full audit trail
-│  S3 + Delta  │  + _ingestion_timestamp, _record_hash, _source_file
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│   SILVER     │  Cleaned, validated, deduplicated
-│  S3 + Delta  │  Schema enforcement, null handling, DQ checks
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│    GOLD      │  Star-schema aggregations for BI consumers
-│  Snowflake   │  Loaded into Snowflake for reporting & analytics
-└──────────────┘
+Raw Sources
+(CSV / JSON / Snowflake / SQL Server / flat files)
+              │
+              ▼
+┌─────────────────────────────────────┐
+│  BRONZE  —  S3 + Delta Lake         │
+│                                     │
+│  Raw ingestion, zero transformation │
+│  Full audit metadata on every row:  │
+│    _ingestion_timestamp             │
+│    _record_hash  (SHA-256)          │
+│    _source_file                     │
+│                                     │
+│  Delta MERGE prevents duplicate     │
+│  loads on re-runs                   │
+└─────────────────┬───────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│  SILVER  —  S3 + Delta Lake         │
+│                                     │
+│  PySpark transformations on EMR     │
+│  Schema enforcement on write        │
+│  Automated DQ checks:               │
+│    - Null % per column              │
+│    - Duplicate detection            │
+│    - String standardization         │
+│    - Schema drift alerts            │
+│  Deduplication via _record_hash     │
+└─────────────────┬───────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│  GOLD  —  Snowflake                 │
+│                                     │
+│  Star-schema aggregations           │
+│  Loaded via Snowflake COPY INTO     │
+│  Optimized for BI consumption       │
+└─────────────────────────────────────┘
 ```
+
+---
 
 ## Stack
 
 | Layer | Technology |
-|-------|-----------|
+|---|---|
 | Storage | Amazon S3 |
 | Table Format | Delta Lake |
-| Processing | AWS Glue, AWS EMR (PySpark) |
+| Ingestion | AWS Glue (dynamic frames, schema evolution) |
+| Processing | AWS EMR — PySpark (broadcast joins, partition pruning, caching) |
 | Orchestration | Apache Airflow on Amazon MWAA |
 | Warehouse | Snowflake |
 | CI/CD | GitHub Actions |
 
-## Files
+---
+
+## Repository Structure
 
 ```
 medallion-architecture-aws/
-├── medallion_pipeline.py       # Core Bronze/Silver/Gold PySpark logic
+├── medallion_pipeline.py        # Bronze / Silver / Gold PySpark logic
 ├── dags/
-│   └── medallion_dag.py        # Airflow DAG for end-to-end orchestration
+│   └── medallion_dag.py         # Airflow DAG — end-to-end orchestration
 ├── glue_jobs/
-│   └── bronze_ingestion.py     # AWS Glue job for raw ingestion
+│   └── bronze_ingestion.py      # Glue job for raw source ingestion
 └── README.md
 ```
 
-## Key Features
+---
 
-- **Bronze Layer** — Raw ingestion with full audit metadata (`_record_hash`, `_ingestion_timestamp`, `_source_file`). Delta Lake merge prevents duplicate loads.
-- **Silver Layer** — PySpark transformations with automated data quality checks: null %, duplicate detection, schema drift alerts. Deduplication via SHA-256 record hash.
-- **Gold Layer** — Star-schema fact tables aggregated from Silver and loaded into Snowflake for BI team consumption.
-- **Airflow DAG** — S3 sensor → Glue bronze job → EMR silver step → EMR gold step → Snowflake validation. Full retry logic, SLA monitoring, and email alerting.
+## Airflow DAG — `medallion_dag.py`
 
-## Data Quality Checks (Silver Layer)
+```
+check_source_data
+└── trigger_glue_bronze_ingestion
+    └── validate_bronze_s3          ← S3KeySensor
+        └── create_emr_cluster
+            └── submit_emr_steps
+                ├── wait_bronze_to_silver
+                └── wait_silver_to_gold
+                    └── validate_row_counts
+                        └── terminate_emr_cluster
+                            └── load_snowflake
+                                └── validate_snowflake_load
+                                    └── notify_success / notify_failure
+```
 
-- Null percentage per column (warns if > 10%)
-- Duplicate record detection via `_record_hash`
-- String standardization (trim, uppercase)
-- Schema validation on write
+- **Schedule:** Daily at 02:00 UTC
+- **SLA:** Must complete within 4 hours
+- **Retries:** 2 retries with 15-minute delay
+- **Alerting:** SNS on success and failure
+
+---
+
+## Bronze Layer — `glue_jobs/bronze_ingestion.py`
+
+AWS Glue job handles raw ingestion with dynamic frames and schema evolution. Absorbs upstream changes from Snowflake, SQL Server, and flat file sources without breaking downstream Silver jobs. Every row gets:
+
+- `_ingestion_timestamp` — wall-clock time of load
+- `_record_hash` — SHA-256 of all business columns (used for deduplication in Silver)
+- `_source_file` — origin file/table for full lineage
+
+Delta MERGE ensures re-running the job on the same source data never creates duplicates.
+
+---
+
+## Silver Layer — `medallion_pipeline.py`
+
+PySpark transformations on AWS EMR. Performance tuning for 10M+ daily record volumes:
+
+- **Broadcast joins** for small dimension tables
+- **Partition pruning** on date and business unit columns
+- **Selective caching** for reused DataFrames across transformation steps
+
+**Data Quality Checks (run before Silver write):**
+
+| Check | Behaviour |
+|---|---|
+| Null % per column | Warns if > 10%, fails if > 30% |
+| Duplicate records | Detected via `_record_hash`, logged and dropped |
+| String standardization | Trim whitespace, uppercase normalization |
+| Schema validation | Enforced on Delta write — mismatches raise exceptions |
+
+---
+
+## Gold Layer
+
+Star-schema fact and dimension tables aggregated from Silver. Loaded into Snowflake using `COPY INTO` with full row-count validation post-load. Designed for direct BI consumption via Tableau and SQL reporting.
+
+---
+
+## CI/CD — GitHub Actions
+
+- **Lint and unit test** on every push
+- **Integration test** against dev MWAA on PR merge
+- **Deploy to production MWAA** on version tag
+
+Separate workflows for Glue job deployment, EMR bootstrap script updates, and Snowflake DDL migrations.
+
+---
 
 ## Setup
 
 1. Deploy Airflow on Amazon MWAA
-2. Set Airflow variables: `emr_cluster_id`
-3. Configure Airflow connections: `aws_default`, `snowflake_default`
-4. Upload `medallion_pipeline.py` to your scripts S3 bucket
-5. Place DAG in your MWAA DAGs S3 bucket
+2. Set Airflow variables: `emr_cluster_id`, `s3_data_lake_bucket`, `snowflake_schema`
+3. Configure connections: `aws_default`, `snowflake_default`
+4. Upload `medallion_pipeline.py` to your EMR bootstrap S3 bucket
+5. Upload `bronze_ingestion.py` to your Glue scripts S3 path
+6. Place `medallion_dag.py` in your MWAA DAGs S3 bucket
+
+---
 
 ## Based On
 
-Real work from the **Optum — Enterprise Data Platform** project (2022–2023), processing healthcare datasets across multiple business units using Delta Lake on Amazon S3.
+Real work at **Optum (UnitedHealth Group)** — Oct 2021 to Dec 2023. Replaced legacy Datastage/SSIS jobs with a fully auditable, schema-resilient Delta Lake architecture processing healthcare datasets across multiple clinical business units.
+
+---
+
+## Author
+
+**Premchand Kothapalli**
+Senior AI / ML Engineer | AWS · Azure AI Foundry · LangGraph · PySpark
+[LinkedIn](https://linkedin.com/in/pc-kothapalli) · premchandkdata@gmail.com · [GitHub](https://github.com/premchand2001)
