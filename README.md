@@ -164,16 +164,3 @@ Separate workflows for Glue job deployment, EMR bootstrap script updates, and Sn
 5. Upload `bronze_ingestion.py` to your Glue scripts S3 path
 6. Place `medallion_dag.py` in your MWAA DAGs S3 bucket
 
----
-
-## Based On
-
-Real work at **Optum (UnitedHealth Group)** — Oct 2021 to Dec 2023. Replaced legacy Datastage/SSIS jobs with a fully auditable, schema-resilient Delta Lake architecture processing healthcare datasets across multiple clinical business units.
-
----
-
-## Author
-
-**Premchand Kothapalli**
-Senior AI / ML Engineer | AWS · Azure AI Foundry · LangGraph · PySpark
-[LinkedIn](https://linkedin.com/in/pc-kothapalli) · premchandkdata@gmail.com · [GitHub](https://github.com/premchand2001)
